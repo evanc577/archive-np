@@ -10,11 +10,14 @@ use scraper::Html;
 use scraper::Selector;
 use serde::Deserialize;
 use std::error::Error;
+use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
+static DEFAULT_MEMBER: &str = "29156514";
+static DEFAULT_DIR: &str = "posts";
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 lazy_static! {
     static ref CLIENT: reqwest::Client = reqwest::Client::builder()
@@ -22,6 +25,23 @@ lazy_static! {
         .build()
         .unwrap();
     static ref ID_RE: Regex = Regex::new(r"volumeNo=(?P<vol>\d+)").unwrap();
+}
+
+#[derive(Debug)]
+enum DownloadNPError {
+    ParseError(String),
+    FileNameError(PathBuf),
+}
+
+impl Error for DownloadNPError {}
+
+impl fmt::Display for DownloadNPError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            DownloadNPError::ParseError(s) => write!(f, "Error parsing string: {:?}", s),
+            DownloadNPError::FileNameError(p) => write!(f, "Error parsing file name: {:?}", p),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -47,7 +67,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .short("d")
                 .long("directory")
                 .value_name("DIR")
-                .help("Directory to download to (default: ./posts)")
+                .help(&format!(
+                    "Directory to download to (default: ./{})",
+                    DEFAULT_DIR
+                ))
                 .takes_value(true),
         )
         .arg(
@@ -55,7 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .short("m")
                 .long("member")
                 .value_name("MEMBER_ID")
-                .help("Set NP member id (default: 29156514)")
+                .help(&format!("Set NP member id (default: {})", DEFAULT_MEMBER))
                 .takes_value(true),
         )
         .arg(
@@ -77,21 +100,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .get_matches();
 
-    let path = PathBuf::from(matches.value_of("DIRECTORY").unwrap_or("posts"));
+    let path = PathBuf::from(matches.value_of("DIRECTORY").unwrap_or(DEFAULT_DIR));
 
     if matches.is_present("URL") {
         for url in matches.values_of("URL").unwrap() {
             process_one(url, &path).await?;
         }
     } else {
-        let member = matches.value_of("MEMBER").unwrap_or("29156514");
+        let member = matches.value_of("MEMBER").unwrap_or(DEFAULT_MEMBER);
         let filter = match matches.is_present("FILTER") {
             true => RegexBuilder::new(matches.value_of("FILTER").unwrap()),
             false => RegexBuilder::new(r".*"),
         }
         .case_insensitive(true)
-        .build()
-        .unwrap();
+        .build()?;
 
         process_member(member, &path, &filter).await?;
     }
@@ -102,10 +124,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn process_one(url: &str, path: &PathBuf) -> Result<(), Box<dyn Error>> {
     let vol = ID_RE
         .captures_iter(&url)
-        .filter_map(|c| c.name("vol"))
-        .map(|m| m.as_str().to_owned())
-        .next()
-        .unwrap();
+        .find_map(|c| c.name("vol"))
+        .ok_or(DownloadNPError::ParseError(url.to_owned()))?
+        .as_str()
+        .to_owned();
     download_np(&vol, &path).await?;
     Ok(())
 }
@@ -215,18 +237,16 @@ async fn download_np(vol: &str, path: &PathBuf) -> Result<(), Box<dyn Error>> {
 
     // real body is hidden inside a <script>, extract it
     let document = Html::parse_document(&body);
-    let fragment = extract_real_body(&document);
+    let fragment = extract_real_body(&document)?;
 
     // extract useful fields
-    let date = extract_date(&document);
-    let title = extract_title(&document);
-    let imgs = extract_images(&fragment);
+    let date = extract_date(&document)?;
+    let title = extract_title(&document)?;
+    let imgs = extract_images(&fragment)?;
     if imgs.is_empty() {
-        println!("No images found!");
+        println!("No images found for vol: {}", vol);
+        return Ok(());
     }
-    // println!("date: {}", date);
-    // println!("title: {}", title);
-    // println!("images: {}", imgs.len());
 
     // check if already downloaded
     let full_path = path.join(format!("{}-{}-{}/", date, vol, title));
@@ -258,7 +278,9 @@ async fn download_np(vol: &str, path: &PathBuf) -> Result<(), Box<dyn Error>> {
 
     // move temp directory
     let options = fs_extra::dir::CopyOptions::new();
-    let temp_dir_2 = path.join(temp_dir.path().file_name().unwrap());
+    let temp_dir_2 = path.join(temp_dir.path().file_name().ok_or(
+        DownloadNPError::FileNameError(temp_dir.path().to_path_buf()),
+    )?);
     fs_extra::dir::copy(&temp_dir, &path, &options)?;
     std::fs::rename(&temp_dir_2, &full_path)?;
 
@@ -272,7 +294,6 @@ async fn download_image(
     path: PathBuf,
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn Error>> {
-    // println!("{} {}", url, path.as_os_str().to_str().unwrap());
     let body = reqwest::get(&url).await?.bytes().await?;
     let mut buffer = File::create(path)?;
     buffer.write_all(&body)?;
@@ -283,53 +304,57 @@ async fn download_image(
 fn extract_extension(url: &str) -> String {
     let path = std::path::Path::new(&url);
     match path.extension() {
-        Some(ext) => format!(".{}", ext.to_str().unwrap().to_lowercase()),
+        Some(ext) => format!(".{}", ext.to_string_lossy().to_lowercase()),
         None => String::from(""),
     }
 }
 
-fn extract_real_body(document: &Html) -> Html {
+fn extract_real_body(document: &Html) -> Result<Html, Box<dyn Error>> {
     lazy_static! {
         static ref BODY_SEL: Selector = Selector::parse("script#__clipContent").unwrap();
     }
     let real_body = document
         .select(&BODY_SEL)
-        .map(|elem| htmlescape::decode_html(&elem.inner_html().as_str()).unwrap())
+        .filter_map(|elem| htmlescape::decode_html(&elem.inner_html().as_str()).ok())
         .collect::<Vec<_>>()
         .join("");
-    Html::parse_fragment(&real_body)
+    Ok(Html::parse_fragment(&real_body))
 }
 
-fn extract_date(fragment: &Html) -> String {
+fn extract_date(fragment: &Html) -> Result<String, Box<dyn Error>> {
     lazy_static! {
         static ref DATE_SEL: Selector =
             Selector::parse(r#"meta[property="og:createdate"]"#).unwrap();
     }
     let date_raw = fragment
         .select(&DATE_SEL)
-        .filter_map(|m| m.value().attr("content"))
-        .next()
-        .unwrap()
+        .find_map(|m| m.value().attr("content"))
+        .ok_or(DownloadNPError::ParseError(fragment.root_element().html()))?
         .trim()
         .replace('\n', "");
-    format!("{}{}{}", &date_raw[0..4], &date_raw[5..7], &date_raw[8..10])
+    Ok(format!(
+        "{}{}{}",
+        &date_raw[0..4],
+        &date_raw[5..7],
+        &date_raw[8..10]
+    ))
 }
 
-fn extract_title(fragment: &Html) -> String {
+fn extract_title(fragment: &Html) -> Result<String, Box<dyn Error>> {
     lazy_static! {
         static ref TITLE_SEL: Selector =
             Selector::parse(r#"meta[property="nv:news:title"]"#).unwrap();
     }
-    fragment
+    let ret = fragment
         .select(&TITLE_SEL)
-        .filter_map(|m| m.value().attr("content"))
-        .next()
-        .unwrap()
+        .find_map(|m| m.value().attr("content"))
+        .ok_or(DownloadNPError::ParseError(fragment.root_element().html()))?
         .trim()
-        .replace('\n', "")
+        .replace('\n', "");
+    Ok(ret)
 }
 
-fn extract_images(fragment: &Html) -> Vec<String> {
+fn extract_images(fragment: &Html) -> Result<Vec<String>, Box<dyn Error>> {
     lazy_static! {
         static ref IMG_SEL_1: Selector =
             Selector::parse(".se_mediaImage, .se_background_img").unwrap();
@@ -339,20 +364,20 @@ fn extract_images(fragment: &Html) -> Vec<String> {
     let find_images = |sel: &Selector| {
         fragment
             .select(sel)
-            .filter_map(|e| e.value().attr("data-src"))
-            .map(|url| {
-                // remove query string for full size images
-                let mut temp = reqwest::Url::parse(url).unwrap();
+            .filter_map(|e| {
+                let url = e.value().attr("data-src")?;
+                let mut temp = reqwest::Url::parse(url).ok()?;
                 temp.query_pairs_mut().clear();
-                temp.as_str().trim_end_matches('?').to_owned()
+                Some(temp.as_str().trim_end_matches('?').to_owned())
             })
             .collect::<Vec<_>>()
     };
 
     let ret = find_images(&IMG_SEL_1);
     if !ret.is_empty() {
-        return ret;
+        return Ok(ret);
     }
 
-    find_images(&IMG_SEL_2)
+    let ret = find_images(&IMG_SEL_2);
+    Ok(ret)
 }
