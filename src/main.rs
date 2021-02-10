@@ -16,6 +16,8 @@ use std::io::prelude::*;
 use std::path::PathBuf;
 use tempfile::tempdir;
 
+type Result<T> = std::result::Result<T, Box<dyn Error>>;
+
 static DEFAULT_MEMBER: &str = "29156514";
 static DEFAULT_DIR: &str = "posts";
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
@@ -57,7 +59,7 @@ impl PartialEq for Volume {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
     let matches = App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
@@ -98,6 +100,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .help("Regex filter on NP title")
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("LIMIT")
+                .short("l")
+                .long("limit")
+                .value_name("POSTS")
+                .help("Limit number of posts to process")
+                .takes_value(true),
+        )
         .get_matches();
 
     let path = PathBuf::from(matches.value_of("DIRECTORY").unwrap_or(DEFAULT_DIR));
@@ -114,14 +124,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         .case_insensitive(true)
         .build()?;
+        let limit = match matches.value_of("LIMIT") {
+            Some(s) => Some(s.parse::<usize>()?),
+            None => None,
+        };
 
-        process_member(member, &path, &filter).await?;
+        process_member(member, &path, &filter, limit).await?;
     }
 
     Ok(())
 }
 
-async fn process_one(url: &str, path: &PathBuf) -> Result<(), Box<dyn Error>> {
+async fn process_one(url: &str, path: &PathBuf) -> Result<()> {
     let vol = ID_RE
         .captures_iter(&url)
         .find_map(|c| c.name("vol"))
@@ -136,7 +150,8 @@ async fn process_member(
     member: &str,
     path: &PathBuf,
     filter: &Regex,
-) -> Result<(), Box<dyn Error>> {
+    limit: Option<usize>,
+) -> Result<()> {
     let mut page: usize = 1;
     let mut first = true;
     let mut num_found = 0;
@@ -156,6 +171,12 @@ async fn process_member(
         num_found = page_np_vols.len();
         np_vols.extend(page_np_vols);
         page += 1;
+        if let Some(l) = limit {
+            if np_vols.len() >= l {
+                np_vols.truncate(l);
+                break;
+            }
+        }
     }
     pb.finish_and_clear();
     np_vols.dedup();
@@ -169,7 +190,7 @@ async fn process_member(
     Ok(())
 }
 
-async fn get_ids(member: &str, page: usize) -> Result<Vec<Volume>, Box<dyn Error>> {
+async fn get_ids(member: &str, page: usize) -> Result<Vec<Volume>> {
     lazy_static! {
         static ref SEL: Selector = Selector::parse("a.link_end").unwrap();
         static ref TITLE_SEL: Selector = Selector::parse(".tit_feed").unwrap();
@@ -224,7 +245,7 @@ async fn get_ids(member: &str, page: usize) -> Result<Vec<Volume>, Box<dyn Error
     Ok(ret)
 }
 
-async fn download_np(vol: &str, path: &PathBuf) -> Result<(), Box<dyn Error>> {
+async fn download_np(vol: &str, path: &PathBuf) -> Result<()> {
     // fetch page
     const URL: &str = "https://post.naver.com/viewer/postView.nhn";
     let body = CLIENT
@@ -293,7 +314,7 @@ async fn download_image(
     url: String,
     path: PathBuf,
     pb: &ProgressBar,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<()> {
     let body = reqwest::get(&url).await?.bytes().await?;
     let mut buffer = File::create(path)?;
     buffer.write_all(&body)?;
@@ -309,7 +330,7 @@ fn extract_extension(url: &str) -> String {
     }
 }
 
-fn extract_real_body(document: &Html) -> Result<Html, Box<dyn Error>> {
+fn extract_real_body(document: &Html) -> Result<Html> {
     lazy_static! {
         static ref BODY_SEL: Selector = Selector::parse("script#__clipContent").unwrap();
     }
@@ -321,7 +342,7 @@ fn extract_real_body(document: &Html) -> Result<Html, Box<dyn Error>> {
     Ok(Html::parse_fragment(&real_body))
 }
 
-fn extract_date(fragment: &Html) -> Result<String, Box<dyn Error>> {
+fn extract_date(fragment: &Html) -> Result<String> {
     lazy_static! {
         static ref DATE_SEL: Selector =
             Selector::parse(r#"meta[property="og:createdate"]"#).unwrap();
@@ -340,7 +361,7 @@ fn extract_date(fragment: &Html) -> Result<String, Box<dyn Error>> {
     ))
 }
 
-fn extract_title(fragment: &Html) -> Result<String, Box<dyn Error>> {
+fn extract_title(fragment: &Html) -> Result<String> {
     lazy_static! {
         static ref TITLE_SEL: Selector =
             Selector::parse(r#"meta[property="nv:news:title"]"#).unwrap();
@@ -354,7 +375,7 @@ fn extract_title(fragment: &Html) -> Result<String, Box<dyn Error>> {
     Ok(ret)
 }
 
-fn extract_images(fragment: &Html) -> Result<Vec<String>, Box<dyn Error>> {
+fn extract_images(fragment: &Html) -> Result<Vec<String>> {
     lazy_static! {
         static ref IMG_SEL_1: Selector =
             Selector::parse(".se_mediaImage, .se_background_img").unwrap();
