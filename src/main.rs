@@ -170,6 +170,7 @@ async fn process_member(
         let page_np_vols = get_ids(&member, page).await?;
         num_found = page_np_vols.len();
         np_vols.extend(page_np_vols);
+        np_vols.dedup();
         page += 1;
         if let Some(l) = limit {
             if np_vols.len() >= l {
@@ -179,7 +180,6 @@ async fn process_member(
         }
     }
     pb.finish_and_clear();
-    np_vols.dedup();
     np_vols.retain(|vol| filter.is_match(&vol.title));
 
     println!("Downloading posts...");
@@ -192,7 +192,7 @@ async fn process_member(
 
 async fn get_ids(member: &str, page: usize) -> Result<Vec<Volume>> {
     lazy_static! {
-        static ref SEL: Selector = Selector::parse("a.link_end").unwrap();
+        static ref SEL: Selector = Selector::parse(".text_area > a.link_end").unwrap();
         static ref TITLE_SEL: Selector = Selector::parse(".tit_feed").unwrap();
         static ref ESCAPE_RE: Regex = Regex::new(r#"\\(?P<c>[^"n])"#).unwrap();
     }
