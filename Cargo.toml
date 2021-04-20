@@ -2,7 +2,7 @@
 name = "download-np"
 description = """Batch downloads images in all posts by a NP member, \
 or download images for a specific NP URL"""
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Evan Chang <evanc577@gmail.com>"]
 edition = "2018"
 

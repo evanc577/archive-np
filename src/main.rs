@@ -6,8 +6,7 @@ use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
 use regex::{Regex, RegexBuilder};
-use scraper::Html;
-use scraper::Selector;
+use scraper::{element_ref::ElementRef, Html, Selector};
 use serde::Deserialize;
 use std::error::Error;
 use std::fmt;
@@ -48,7 +47,8 @@ impl fmt::Display for DownloadNPError {
 
 #[derive(Debug)]
 struct Volume {
-    title: String,
+    title: Option<String>,
+    date: Option<String>,
     id: String,
 }
 
@@ -136,12 +136,18 @@ async fn main() -> Result<()> {
 }
 
 async fn process_one(url: &str, path: &PathBuf) -> Result<()> {
-    let vol = ID_RE
+    let id = ID_RE
         .captures_iter(&url)
         .find_map(|c| c.name("vol"))
         .ok_or(DownloadNPError::ParseError(url.to_owned()))?
         .as_str()
         .to_owned();
+    let vol = Volume {
+        id,
+        title: None,
+        date: None,
+    };
+
     download_np(&vol, &path).await?;
     Ok(())
 }
@@ -157,17 +163,16 @@ async fn process_member(
     let mut num_found = 0;
     let mut np_vols: Vec<Volume> = vec![];
 
-    println!("Retrieving IDs...");
     let pb = ProgressBar::new_spinner();
     let sty = ProgressStyle::default_bar()
-        .template("Downloading page {pos:} {spinner}")
+        .template("Retrieving member page {pos:} {spinner}")
         .progress_chars("=> ");
     pb.set_style(sty);
 
     while first || num_found > 0 {
         pb.set_position(page as u64);
         first = false;
-        let page_np_vols = get_ids(&member, page).await?;
+        let page_np_vols = volume_from_member(&member, page).await?;
         num_found = page_np_vols.len();
         np_vols.extend(page_np_vols);
         np_vols.dedup();
@@ -180,20 +185,23 @@ async fn process_member(
         }
     }
     pb.finish_and_clear();
-    np_vols.retain(|vol| filter.is_match(&vol.title));
+    np_vols.retain(|vol| match &vol.title {
+        Some(title) => filter.is_match(&title),
+        None => false,
+    });
 
-    println!("Downloading posts...");
     for vol in np_vols {
-        download_np(vol.id.as_str(), &path).await?;
+        download_np(&vol, &path).await?;
     }
 
     Ok(())
 }
 
-async fn get_ids(member: &str, page: usize) -> Result<Vec<Volume>> {
+async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
     lazy_static! {
-        static ref SEL: Selector = Selector::parse(".text_area > a.link_end").unwrap();
+        static ref SEL: Selector = Selector::parse("li").unwrap();
         static ref TITLE_SEL: Selector = Selector::parse(".tit_feed").unwrap();
+        static ref DATE_SEL: Selector = Selector::parse(".date_post").unwrap();
         static ref ESCAPE_RE: Regex = Regex::new(r#"\\(?P<c>[^"n])"#).unwrap();
     }
     const URL: &str = "https://post.naver.com/async/my.nhn";
@@ -221,22 +229,44 @@ async fn get_ids(member: &str, page: usize) -> Result<Vec<Volume>> {
         .select(&SEL)
         .filter_map(|e| {
             // get volume number
-            let vol = ID_RE
-                .captures_iter(&e.value().attr("href")?)
-                .filter_map(|c| c.name("vol"))
-                .map(|m| m.as_str().to_owned())
-                .next()?;
-            // try to get title
+            let id = e.value().attr("volumeno")?;
+
+            // get title
             let title = match Html::parse_fragment(&e.inner_html())
                 .select(&TITLE_SEL)
                 .next()
             {
-                Some(v) => v.text().collect::<Vec<_>>().join(""),
-                None => String::from(""),
+                Some(v) => Some(
+                    v.text()
+                        .collect::<Vec<_>>()
+                        .join("")
+                        .replace("\n", "")
+                        .trim()
+                        .to_owned(),
+                ),
+                None => None,
             };
+
+            // get date
+            let date = match Html::parse_fragment(&e.inner_html())
+                .select(&DATE_SEL)
+                .next()
+            {
+                Some(v) => Some(
+                    v.text()
+                        .collect::<Vec<_>>()
+                        .join("")
+                        .replace(".", "")
+                        .trim()
+                        .to_owned(),
+                ),
+                None => None,
+            };
+
             let ret = Volume {
                 title,
-                id: String::from(vol),
+                date,
+                id: String::from(id),
             };
             Some(ret)
         })
@@ -245,12 +275,23 @@ async fn get_ids(member: &str, page: usize) -> Result<Vec<Volume>> {
     Ok(ret)
 }
 
-async fn download_np(vol: &str, path: &PathBuf) -> Result<()> {
+async fn download_np(vol: &Volume, path: &PathBuf) -> Result<()> {
+    // check if already downloaded
+    if vol.title.is_some() && vol.date.is_some() {
+        let date = vol.date.as_ref().unwrap();
+        let title = vol.title.as_ref().unwrap();
+
+        let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
+        if full_path.exists() {
+            return Ok(());
+        }
+    }
+
     // fetch page
     const URL: &str = "https://post.naver.com/viewer/postView.nhn";
     let body = CLIENT
         .get(URL)
-        .query(&[("volumeNo", vol)])
+        .query(&[("volumeNo", &vol.id)])
         .send()
         .await?
         .text()
@@ -259,19 +300,24 @@ async fn download_np(vol: &str, path: &PathBuf) -> Result<()> {
     // real body is hidden inside a <script>, extract it
     let document = Html::parse_document(&body);
     let fragment = extract_real_body(&document)?;
+    let root = fragment.root_element();
 
-    // extract useful fields
-    let date = extract_date(&document)?;
-    let title = extract_title(&document)?;
-    let imgs = extract_images(&fragment)?;
-    if imgs.is_empty() {
-        println!("No images found for vol: {}", vol);
-        return Ok(());
-    }
+    // extract metadata
+    let date = extract_date(&document.root_element())?;
+    let title = extract_title(&document.root_element())?;
 
     // check if already downloaded
-    let full_path = path.join(format!("{}-{}-{}/", date, vol, title));
-    if full_path.exists() {
+    let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
+    if vol.title.is_none() || vol.date.is_none() {
+        if full_path.exists() {
+            return Ok(());
+        }
+    }
+
+    // extract images
+    let imgs = extract_images(&root)?;
+    if imgs.is_empty() {
+        println!("No images found for vol: {}", vol.id);
         return Ok(());
     }
 
@@ -286,11 +332,11 @@ async fn download_np(vol: &str, path: &PathBuf) -> Result<()> {
     pb.set_style(sty);
 
     // download all images
-    println!("Downloading {}...", title);
+    println!("{}...", title);
     let temp_dir = tempdir()?;
     futures::stream::iter(imgs.into_iter().enumerate().map(|(i, url)| {
         let ext = extract_extension(&url);
-        let filename = format!("{}-{}-{}-img{:03}{}", date, vol, title, i + 1, ext);
+        let filename = format!("{}-{}-{}-img{:03}{}", date, vol.id, title, i + 1, ext);
         download_image(url.to_owned(), temp_dir.path().join(filename), &pb)
     }))
     .buffer_unordered(20)
@@ -310,11 +356,7 @@ async fn download_np(vol: &str, path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn download_image(
-    url: String,
-    path: PathBuf,
-    pb: &ProgressBar,
-) -> Result<()> {
+async fn download_image(url: String, path: PathBuf, pb: &ProgressBar) -> Result<()> {
     let body = reqwest::get(&url).await?.bytes().await?;
     let mut buffer = File::create(path)?;
     buffer.write_all(&body)?;
@@ -342,15 +384,15 @@ fn extract_real_body(document: &Html) -> Result<Html> {
     Ok(Html::parse_fragment(&real_body))
 }
 
-fn extract_date(fragment: &Html) -> Result<String> {
+fn extract_date(element: &ElementRef) -> Result<String> {
     lazy_static! {
         static ref DATE_SEL: Selector =
             Selector::parse(r#"meta[property="og:createdate"]"#).unwrap();
     }
-    let date_raw = fragment
+    let date_raw = element
         .select(&DATE_SEL)
         .find_map(|m| m.value().attr("content"))
-        .ok_or(DownloadNPError::ParseError(fragment.root_element().html()))?
+        .ok_or(DownloadNPError::ParseError(element.html()))?
         .trim()
         .replace('\n', "");
     Ok(format!(
@@ -361,21 +403,21 @@ fn extract_date(fragment: &Html) -> Result<String> {
     ))
 }
 
-fn extract_title(fragment: &Html) -> Result<String> {
+fn extract_title(element: &ElementRef) -> Result<String> {
     lazy_static! {
         static ref TITLE_SEL: Selector =
             Selector::parse(r#"meta[property="nv:news:title"]"#).unwrap();
     }
-    let ret = fragment
+    let ret = element
         .select(&TITLE_SEL)
         .find_map(|m| m.value().attr("content"))
-        .ok_or(DownloadNPError::ParseError(fragment.root_element().html()))?
+        .ok_or(DownloadNPError::ParseError(element.html()))?
         .trim()
         .replace('\n', "");
     Ok(ret)
 }
 
-fn extract_images(fragment: &Html) -> Result<Vec<String>> {
+fn extract_images(element: &ElementRef) -> Result<Vec<String>> {
     lazy_static! {
         static ref IMG_SEL_1: Selector =
             Selector::parse(".se_mediaImage, .se_background_img").unwrap();
@@ -383,7 +425,7 @@ fn extract_images(fragment: &Html) -> Result<Vec<String>> {
     }
 
     let find_images = |sel: &Selector| {
-        fragment
+        element
             .select(sel)
             .filter_map(|e| {
                 let url = e.value().attr("data-src")?;
