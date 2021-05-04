@@ -420,8 +420,8 @@ fn extract_title(element: &ElementRef) -> Result<String> {
 fn extract_images(element: &ElementRef) -> Result<Vec<String>> {
     lazy_static! {
         static ref IMG_SEL_1: Selector =
-            Selector::parse(".se_mediaImage, .se_background_img").unwrap();
-        static ref IMG_SEL_2: Selector = Selector::parse(".img_attachedfile").unwrap();
+            Selector::parse("img.se_mediaImage, img.se_background_img").unwrap();
+        static ref IMG_SEL_2: Selector = Selector::parse("img.img_attachedfile").unwrap();
     }
 
     let find_images = |sel: &Selector| {
@@ -429,6 +429,9 @@ fn extract_images(element: &ElementRef) -> Result<Vec<String>> {
             .select(sel)
             .filter_map(|e| {
                 let url = e.value().attr("data-src")?;
+                if !url.contains("post-phinf.pstatic.net") {
+                    return None;
+                }
                 let mut temp = reqwest::Url::parse(url).ok()?;
                 temp.query_pairs_mut().clear();
                 Some(temp.as_str().trim_end_matches('?').to_owned())
