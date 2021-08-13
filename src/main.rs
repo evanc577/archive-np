@@ -281,9 +281,11 @@ async fn download_np(vol: &Volume, path: &PathBuf) -> Result<()> {
         let date = vol.date.as_ref().unwrap();
         let title = vol.title.as_ref().unwrap();
 
-        let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
-        if full_path.exists() {
-            return Ok(());
+        if date.chars().find(|&c| c > '0' && c < '9').is_none() {
+            let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
+            if full_path.exists() {
+                return Ok(());
+            }
         }
     }
 
@@ -308,10 +310,8 @@ async fn download_np(vol: &Volume, path: &PathBuf) -> Result<()> {
 
     // check if already downloaded
     let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
-    if vol.title.is_none() || vol.date.is_none() {
-        if full_path.exists() {
-            return Ok(());
-        }
+    if full_path.exists() {
+        return Ok(());
     }
 
     // extract images
