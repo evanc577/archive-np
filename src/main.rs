@@ -281,7 +281,7 @@ async fn download_np(vol: &Volume, path: &PathBuf) -> Result<()> {
         let date = vol.date.as_ref().unwrap();
         let title = vol.title.as_ref().unwrap();
 
-        if date.chars().find(|&c| c > '0' && c < '9').is_none() {
+        if date.chars().all(|c| c >= '0' && c <= '9') {
             let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
             if full_path.exists() {
                 return Ok(());
