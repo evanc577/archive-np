@@ -6,13 +6,14 @@ use futures::stream::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
 use regex::{Regex, RegexBuilder};
-use scraper::{element_ref::ElementRef, Html, Selector};
+use scraper::element_ref::ElementRef;
+use scraper::{Html, Selector};
 use serde::Deserialize;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -135,11 +136,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn process_one(url: &str, path: &PathBuf) -> Result<()> {
+async fn process_one(url: &str, path: &Path) -> Result<()> {
     let id = ID_RE
-        .captures_iter(&url)
+        .captures_iter(url)
         .find_map(|c| c.name("vol"))
-        .ok_or(DownloadNPError::ParseError(url.to_owned()))?
+        .ok_or_else(|| DownloadNPError::ParseError(url.to_owned()))?
         .as_str()
         .to_owned();
     let vol = Volume {
@@ -148,13 +149,13 @@ async fn process_one(url: &str, path: &PathBuf) -> Result<()> {
         date: None,
     };
 
-    download_np(&vol, &path).await?;
+    download_np(&vol, path).await?;
     Ok(())
 }
 
 async fn process_member(
     member: &str,
-    path: &PathBuf,
+    path: &Path,
     filter: &Regex,
     limit: Option<usize>,
 ) -> Result<()> {
@@ -172,7 +173,7 @@ async fn process_member(
     while first || num_found > 0 {
         pb.set_position(page as u64);
         first = false;
-        let page_np_vols = volume_from_member(&member, page).await?;
+        let page_np_vols = volume_from_member(member, page).await?;
         num_found = page_np_vols.len();
         np_vols.extend(page_np_vols);
         np_vols.dedup();
@@ -186,12 +187,12 @@ async fn process_member(
     }
     pb.finish_and_clear();
     np_vols.retain(|vol| match &vol.title {
-        Some(title) => filter.is_match(&title),
+        Some(title) => filter.is_match(title),
         None => false,
     });
 
     for vol in np_vols {
-        download_np(&vol, &path).await?;
+        download_np(&vol, path).await?;
     }
 
     Ok(())
@@ -206,6 +207,7 @@ async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
     }
     const URL: &str = "https://post.naver.com/async/my.nhn";
 
+    #[allow(clippy::upper_case_acronyms)]
     #[derive(Deserialize)]
     struct HTML {
         html: String,
@@ -232,36 +234,30 @@ async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
             let id = e.value().attr("volumeno")?;
 
             // get title
-            let title = match Html::parse_fragment(&e.inner_html())
+            let title = Html::parse_fragment(&e.inner_html())
                 .select(&TITLE_SEL)
                 .next()
-            {
-                Some(v) => Some(
+                .map(|v| {
                     v.text()
                         .collect::<Vec<_>>()
                         .join("")
                         .replace("\n", "")
                         .trim()
-                        .to_owned(),
-                ),
-                None => None,
-            };
+                        .to_owned()
+                });
 
             // get date
-            let date = match Html::parse_fragment(&e.inner_html())
+            let date = Html::parse_fragment(&e.inner_html())
                 .select(&DATE_SEL)
                 .next()
-            {
-                Some(v) => Some(
+                .map(|v| {
                     v.text()
                         .collect::<Vec<_>>()
                         .join("")
                         .replace(".", "")
                         .trim()
-                        .to_owned(),
-                ),
-                None => None,
-            };
+                        .to_owned()
+                });
 
             let ret = Volume {
                 title,
@@ -275,13 +271,13 @@ async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
     Ok(ret)
 }
 
-async fn download_np(vol: &Volume, path: &PathBuf) -> Result<()> {
+async fn download_np(vol: &Volume, path: &Path) -> Result<()> {
     // check if already downloaded
     if vol.title.is_some() && vol.date.is_some() {
         let date = vol.date.as_ref().unwrap();
         let title = vol.title.as_ref().unwrap();
 
-        if date.chars().all(|c| c >= '0' && c <= '9') {
+        if date.chars().all(|c| ('0'..='9').contains(&c)) {
             let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
             if full_path.exists() {
                 return Ok(());
@@ -337,7 +333,7 @@ async fn download_np(vol: &Volume, path: &PathBuf) -> Result<()> {
     futures::stream::iter(imgs.into_iter().enumerate().map(|(i, url)| {
         let ext = extract_extension(&url);
         let filename = format!("{}-{}-{}-img{:03}{}", date, vol.id, title, i + 1, ext);
-        download_image(url.to_owned(), temp_dir.path().join(filename), &pb)
+        download_image(url, temp_dir.path().join(filename), &pb)
     }))
     .buffer_unordered(20)
     .collect::<Vec<_>>()
@@ -345,9 +341,12 @@ async fn download_np(vol: &Volume, path: &PathBuf) -> Result<()> {
 
     // move temp directory
     let options = fs_extra::dir::CopyOptions::new();
-    let temp_dir_2 = path.join(temp_dir.path().file_name().ok_or(
-        DownloadNPError::FileNameError(temp_dir.path().to_path_buf()),
-    )?);
+    let temp_dir_2 = path.join(
+        temp_dir
+            .path()
+            .file_name()
+            .ok_or_else(|| DownloadNPError::FileNameError(temp_dir.path().to_path_buf()))?,
+    );
     fs_extra::dir::copy(&temp_dir, &path, &options)?;
     std::fs::rename(&temp_dir_2, &full_path)?;
 
@@ -378,7 +377,7 @@ fn extract_real_body(document: &Html) -> Result<Html> {
     }
     let real_body = document
         .select(&BODY_SEL)
-        .filter_map(|elem| htmlescape::decode_html(&elem.inner_html().as_str()).ok())
+        .filter_map(|elem| htmlescape::decode_html(elem.inner_html().as_str()).ok())
         .collect::<Vec<_>>()
         .join("");
     Ok(Html::parse_fragment(&real_body))
@@ -392,7 +391,7 @@ fn extract_date(element: &ElementRef) -> Result<String> {
     let date_raw = element
         .select(&DATE_SEL)
         .find_map(|m| m.value().attr("content"))
-        .ok_or(DownloadNPError::ParseError(element.html()))?
+        .ok_or_else(|| DownloadNPError::ParseError(element.html()))?
         .trim()
         .replace('\n', "");
     Ok(format!(
@@ -411,7 +410,7 @@ fn extract_title(element: &ElementRef) -> Result<String> {
     let ret = element
         .select(&TITLE_SEL)
         .find_map(|m| m.value().attr("content"))
-        .ok_or(DownloadNPError::ParseError(element.html()))?
+        .ok_or_else(|| DownloadNPError::ParseError(element.html()))?
         .trim()
         .replace('\n', "");
     Ok(ret)
