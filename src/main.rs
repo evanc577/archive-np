@@ -1,32 +1,78 @@
-extern crate clap;
-extern crate fs_extra;
-
-use clap::{App, Arg};
-use futures::stream::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
-use lazy_static::lazy_static;
-use regex::{Regex, RegexBuilder};
-use scraper::element_ref::ElementRef;
-use scraper::{Html, Selector};
-use serde::Deserialize;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
+
+use clap::{Parser, Subcommand};
+use futures::stream::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
+use lazy_static::lazy_static;
+use regex::{Regex, RegexBuilder};
+use reqwest::header::{self, HeaderValue};
+use reqwest::Client;
+use scraper::element_ref::ElementRef;
+use scraper::{Html, Selector};
+use serde::Deserialize;
 use tempfile::tempdir;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-static DEFAULT_MEMBER: &str = "29156514";
-static DEFAULT_DIR: &str = "posts";
-static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 lazy_static! {
-    static ref CLIENT: reqwest::Client = reqwest::Client::builder()
-        .user_agent(APP_USER_AGENT)
+    static ref ID_RE: Regex = Regex::new(r"volumeNo=(?P<vol>\d+)").unwrap();
+}
+
+#[derive(Parser)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+    #[arg(short, long, default_value = "posts")]
+    directory: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Member {
+        #[arg(default_value = "29156514")]
+        id: String,
+        #[arg(short, long)]
+        filter: Option<String>,
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+    Url {
+        urls: Vec<String>,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let client: reqwest::Client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:134.0) Gecko/20100101 Firefox/134.0")
         .build()
         .unwrap();
-    static ref ID_RE: Regex = Regex::new(r"volumeNo=(?P<vol>\d+)").unwrap();
+
+    match args.command {
+        Command::Url { urls } => {
+            for url in urls {
+                process_one(&client, &url, &args.directory).await?;
+            }
+        }
+        Command::Member { id, filter, limit } => {
+            let filter = match filter {
+                Some(f) => RegexBuilder::new(&f),
+                None => RegexBuilder::new(r".*"),
+            }
+            .case_insensitive(true)
+            .build()?;
+
+            process_member(&client, &id, &args.directory, &filter, limit).await?;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -59,84 +105,7 @@ impl PartialEq for Volume {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let matches = App::new(env!("CARGO_PKG_NAME"))
-        .version(env!("CARGO_PKG_VERSION"))
-        .author(env!("CARGO_PKG_AUTHORS"))
-        .about(env!("CARGO_PKG_DESCRIPTION"))
-        .arg(
-            Arg::with_name("DIRECTORY")
-                .short("d")
-                .long("directory")
-                .value_name("DIR")
-                .help(&format!(
-                    "Directory to download to (default: ./{})",
-                    DEFAULT_DIR
-                ))
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("MEMBER")
-                .short("m")
-                .long("member")
-                .value_name("MEMBER_ID")
-                .help(&format!("Set NP member id (default: {})", DEFAULT_MEMBER))
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("URL")
-                .short("u")
-                .long("url")
-                .value_name("URL")
-                .multiple(true)
-                .help("Download NP URL")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("FILTER")
-                .short("f")
-                .long("filter")
-                .value_name("REGEX")
-                .help("Regex filter on NP title")
-                .takes_value(true),
-        )
-        .arg(
-            Arg::with_name("LIMIT")
-                .short("l")
-                .long("limit")
-                .value_name("POSTS")
-                .help("Limit number of posts to process")
-                .takes_value(true),
-        )
-        .get_matches();
-
-    let path = PathBuf::from(matches.value_of("DIRECTORY").unwrap_or(DEFAULT_DIR));
-
-    if matches.is_present("URL") {
-        for url in matches.values_of("URL").unwrap() {
-            process_one(url, &path).await?;
-        }
-    } else {
-        let member = matches.value_of("MEMBER").unwrap_or(DEFAULT_MEMBER);
-        let filter = match matches.is_present("FILTER") {
-            true => RegexBuilder::new(matches.value_of("FILTER").unwrap()),
-            false => RegexBuilder::new(r".*"),
-        }
-        .case_insensitive(true)
-        .build()?;
-        let limit = match matches.value_of("LIMIT") {
-            Some(s) => Some(s.parse::<usize>()?),
-            None => None,
-        };
-
-        process_member(member, &path, &filter, limit).await?;
-    }
-
-    Ok(())
-}
-
-async fn process_one(url: &str, path: &Path) -> Result<()> {
+async fn process_one(client: &Client, url: &str, path: &Path) -> Result<()> {
     let id = ID_RE
         .captures_iter(url)
         .find_map(|c| c.name("vol"))
@@ -149,11 +118,12 @@ async fn process_one(url: &str, path: &Path) -> Result<()> {
         date: None,
     };
 
-    download_np(&vol, path).await?;
+    download_np(client, &vol, path).await?;
     Ok(())
 }
 
 async fn process_member(
+    client: &Client,
     member: &str,
     path: &Path,
     filter: &Regex,
@@ -173,7 +143,7 @@ async fn process_member(
     while first || num_found > 0 {
         pb.set_position(page as u64);
         first = false;
-        let page_np_vols = volume_from_member(member, page).await?;
+        let page_np_vols = volume_from_member(client, member, page).await?;
         num_found = page_np_vols.len();
         np_vols.extend(page_np_vols);
         np_vols.dedup();
@@ -192,13 +162,13 @@ async fn process_member(
     });
 
     for vol in np_vols {
-        download_np(&vol, path).await?;
+        download_np(client, &vol, path).await?;
     }
 
     Ok(())
 }
 
-async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
+async fn volume_from_member(client: &Client, member: &str, page: usize) -> Result<Vec<Volume>> {
     lazy_static! {
         static ref SEL: Selector = Selector::parse("li").unwrap();
         static ref TITLE_SEL: Selector = Selector::parse(".tit_feed").unwrap();
@@ -213,7 +183,7 @@ async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
         html: String,
     }
 
-    let text = CLIENT
+    let text = client
         .get(URL)
         .query(&[
             ("memberNo", member.to_owned()),
@@ -241,7 +211,7 @@ async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
                     v.text()
                         .collect::<Vec<_>>()
                         .join("")
-                        .replace("\n", "")
+                        .replace('\n', "")
                         .trim()
                         .to_owned()
                 });
@@ -254,7 +224,7 @@ async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
                     v.text()
                         .collect::<Vec<_>>()
                         .join("")
-                        .replace(".", "")
+                        .replace('.', "")
                         .trim()
                         .to_owned()
                 });
@@ -271,13 +241,13 @@ async fn volume_from_member(member: &str, page: usize) -> Result<Vec<Volume>> {
     Ok(ret)
 }
 
-async fn download_np(vol: &Volume, path: &Path) -> Result<()> {
+async fn download_np(client: &Client, vol: &Volume, path: &Path) -> Result<()> {
     // check if already downloaded
     if vol.title.is_some() && vol.date.is_some() {
         let date = vol.date.as_ref().unwrap();
         let title = vol.title.as_ref().unwrap();
 
-        if date.chars().all(|c| ('0'..='9').contains(&c)) {
+        if date.chars().all(|c: char| c.is_ascii_digit()) {
             let full_path = path.join(format!("{}-{}-{}/", date, vol.id, title));
             if full_path.exists() {
                 return Ok(());
@@ -287,7 +257,7 @@ async fn download_np(vol: &Volume, path: &Path) -> Result<()> {
 
     // fetch page
     const URL: &str = "https://post.naver.com/viewer/postView.nhn";
-    let body = CLIENT
+    let body = client
         .get(URL)
         .query(&[("volumeNo", &vol.id)])
         .send()
@@ -318,7 +288,7 @@ async fn download_np(vol: &Volume, path: &Path) -> Result<()> {
     }
 
     // create base directory if it doesn't exist
-    let _ = std::fs::create_dir_all(&path);
+    let _ = std::fs::create_dir_all(path);
 
     // create progress bar
     let pb = ProgressBar::new(imgs.len() as u64);
@@ -333,11 +303,13 @@ async fn download_np(vol: &Volume, path: &Path) -> Result<()> {
     futures::stream::iter(imgs.into_iter().enumerate().map(|(i, url)| {
         let ext = extract_extension(&url);
         let filename = format!("{}-{}-{}-img{:03}{}", date, vol.id, title, i + 1, ext);
-        download_image(url, temp_dir.path().join(filename), &pb)
+        download_image(client, url, temp_dir.path().join(filename), &pb)
     }))
     .buffer_unordered(20)
     .collect::<Vec<_>>()
-    .await;
+    .await
+    .into_iter()
+    .collect::<Result<_>>()?;
 
     // move temp directory
     let options = fs_extra::dir::CopyOptions::new();
@@ -347,7 +319,7 @@ async fn download_np(vol: &Volume, path: &Path) -> Result<()> {
             .file_name()
             .ok_or_else(|| DownloadNPError::FileNameError(temp_dir.path().to_path_buf()))?,
     );
-    fs_extra::dir::copy(&temp_dir, &path, &options)?;
+    fs_extra::dir::copy(&temp_dir, path, &options)?;
     std::fs::rename(&temp_dir_2, &full_path)?;
 
     pb.finish_and_clear();
@@ -355,8 +327,23 @@ async fn download_np(vol: &Volume, path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn download_image(url: String, path: PathBuf, pb: &ProgressBar) -> Result<()> {
-    let body = reqwest::get(&url).await?.bytes().await?;
+async fn download_image(
+    client: &Client,
+    url: String,
+    path: PathBuf,
+    pb: &ProgressBar,
+) -> Result<()> {
+    let body = client
+        .get(&url)
+        .header(
+            header::REFERER,
+            HeaderValue::from_static("https://m.post.naver.com/"),
+        )
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
     let mut buffer = File::create(path)?;
     buffer.write_all(&body)?;
     pb.inc(1);
@@ -418,8 +405,7 @@ fn extract_title(element: &ElementRef) -> Result<String> {
 
 fn extract_images(element: &ElementRef) -> Result<Vec<String>> {
     lazy_static! {
-        static ref IMG_SEL_1: Selector =
-            Selector::parse("img.se_mediaImage, img.se_background_img").unwrap();
+        static ref IMG_SEL_1: Selector = Selector::parse("img.se_mediaImage").unwrap();
         static ref IMG_SEL_2: Selector = Selector::parse("img.img_attachedfile").unwrap();
     }
 
