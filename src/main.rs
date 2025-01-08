@@ -136,7 +136,7 @@ async fn process_member(
 
     let pb = ProgressBar::new_spinner();
     let sty = ProgressStyle::default_bar()
-        .template("Retrieving member page {pos:} {spinner}")
+        .template("Retrieving member page {pos:} {spinner}")?
         .progress_chars("=> ");
     pb.set_style(sty);
 
@@ -293,7 +293,7 @@ async fn download_np(client: &Client, vol: &Volume, path: &Path) -> Result<()> {
     // create progress bar
     let pb = ProgressBar::new(imgs.len() as u64);
     let sty = ProgressStyle::default_bar()
-        .template("[{wide_bar}] {pos:>3}/{len:3}")
+        .template("[{wide_bar}] {pos:>3}/{len:3}")?
         .progress_chars("=> ");
     pb.set_style(sty);
 
